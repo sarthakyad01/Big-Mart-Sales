@@ -1,0 +1,163 @@
+---
+title: "Big Mart Sales"
+output: html_document
+date: "2024-06-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(GGally)
+library(caret)
+library(rpart)
+library(gbm)
+library(randomForest)
+df_train<-read.csv('train.csv')
+df_test<-read.csv('test.csv')
+head(df_train)
+head(df_test)
+```
+```{r}
+library(dplyr)
+sum(is.na(df_train))
+```
+```{r}
+missing_values <- sapply(df_train, function(x) sum(is.na(x)))
+
+# Convert the result to a data frame for better readability
+missing_values_df <- data.frame(Column = names(missing_values), MissingValues = missing_values)
+
+# Display the columns with their respective number of missing values
+missing_values_df
+```
+```{r}
+df_train <- df_train %>%
+  mutate(Item_Weight = ifelse(is.na(Item_Weight), mean(Item_Weight, na.rm = TRUE), Item_Weight))
+sum(is.na(df_train))
+```
+```{r}
+mode_outlet_size <- df_train %>%
+  group_by(Outlet_Type) %>%
+  summarize(Mode_Outlet_Size = as.character(stats::na.omit(Outlet_Size)[which.max(tabulate(match(stats::na.omit(Outlet_Size), unique(stats::na.omit(Outlet_Size)))))]))
+df_train <- df_train %>%
+  left_join(mode_outlet_size, by = "Outlet_Type") %>%
+  mutate(Outlet_Size = ifelse(is.na(Outlet_Size), Mode_Outlet_Size, Outlet_Size)) %>%
+  select(-Mode_Outlet_Size)
+```
+
+```{r}
+df_train <- df_train %>%
+  mutate(Item_Fat_Content = recode(Item_Fat_Content,
+                                   "LF" = "Low Fat",
+                                   "low fat" = "Low Fat",
+                                   "reg" = "Regular"))
+categorical_vars <- c('Item_Fat_Content', 'Item_Type', 'Outlet_Identifier', 'Outlet_Size', 'Outlet_Location_Type', 'Outlet_Type')
+
+for (var in categorical_vars) {
+  df_train[[var]] <- as.numeric(factor(df_train[[var]]))
+}
+head(df_train)
+```
+```{r}
+df_train <- df_train %>%
+  mutate(Outlet_Age = 2013 - Outlet_Establishment_Year) %>%
+  mutate(Item_Visibility_Bin = cut(Item_Visibility, breaks = c(-Inf, 0.05, 0.1, 0.15, Inf), labels = c("Low", "Medium", "High", "Very High"))) %>%
+  mutate(Item_Type_Aggregate = case_when(
+    Item_Type %in% c('Dairy', 'Meat', 'Breads', 'Breakfast', 'Canned', 'Frozen Foods') ~ 'Food',
+    Item_Type %in% c('Soft Drinks', 'Hard Drinks', 'Health and Hygiene') ~ 'Drinks',
+    Item_Type %in% c('Household', 'Others', 'Starchy Foods') ~ 'Non-Consumable',
+    TRUE ~ as.character(Item_Type)
+  )) %>%
+  mutate(Item_MRP_Outlet_Type = interaction(Item_MRP, Outlet_Type),
+         Item_Visibility_Outlet_Type = interaction(Item_Visibility, Outlet_Type)) %>%
+  mutate(Log_Item_Outlet_Sales = log(Item_Outlet_Sales + 1))
+head(df_train)
+```
+```{r}
+set.seed(123)
+trainIndex <- createDataPartition(df_train$Item_Outlet_Sales, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+trainData <- df_train[ trainIndex,]
+testData  <- df_train[-trainIndex,]
+trainData <- trainData %>% select(-Item_Identifier)
+testData <- testData %>% select(-Item_Identifier)
+factor_columns <- c("Outlet_Identifier", "Item_Type", "Outlet_Size", "Outlet_Location_Type", "Outlet_Type", "Item_Fat_Content", "Item_Type_Aggregate", "Item_Visibility_Bin")
+
+for (col in factor_columns) {
+  levels(trainData[[col]]) <- union(levels(trainData[[col]]), levels(testData[[col]]))
+  levels(testData[[col]]) <- union(levels(trainData[[col]]), levels(testData[[col]]))
+}
+```
+
+```{r}
+ggplot(df_train, aes(x = Item_Outlet_Sales)) +
+  geom_histogram(binwidth = 100, fill = "blue", color = "black") +
+  ggtitle("Distribution of Outlet Sales") +
+  xlab("Outlet Sales") +
+  ylab("Frequency")
+
+ggplot(df_train, aes(x = Outlet_Type, y = Item_Outlet_Sales, fill = Outlet_Type)) +
+  geom_boxplot() +
+  ggtitle("Outlet Sales by Outlet Type") +
+  xlab("Outlet Type") +
+  ylab("Outlet Sales")
+
+ggplot(df_train, aes(x = Item_MRP, y = Item_Outlet_Sales)) +
+  geom_point(alpha = 0.5) +
+  ggtitle("Item MRP vs Outlet Sales") +
+  xlab("Item MRP") +
+  ylab("Outlet Sales")
+```
+```{r}
+df_train <- df_train %>%
+  mutate(Outlet_Size = as.factor(Outlet_Size),
+         Outlet_Location_Type = as.factor(Outlet_Location_Type),
+         Outlet_Type = as.factor(Outlet_Type),
+         Item_Fat_Content = as.factor(Item_Fat_Content),
+         Item_Type = as.factor(Item_Type))
+head(df_train)
+```
+
+```{r}
+decision_tree_model <- rpart(Item_Outlet_Sales ~ ., data = trainData, method = "anova")
+printcp(decision_tree_model)
+pred_dt <- predict(decision_tree_model, testData)
+rmse_dt <- sqrt(mean((pred_dt - testData$Item_Outlet_Sales)^2))
+print(paste("RMSE for Decision Tree: ", rmse_dt))
+```
+```{r}
+trainData$Item_Type_Aggregate <- as.factor(trainData$Item_Type_Aggregate)
+trainData <- trainData %>% select(-Item_MRP_Outlet_Type)
+trainData <- trainData %>% select(-Item_Visibility_Outlet_Type)
+boosting_model <- gbm(Item_Outlet_Sales ~ ., data = trainData, distribution = "gaussian", n.trees = 5000, interaction.depth = 4, shrinkage = 0.01, cv.folds = 5, n.cores = NULL, verbose = FALSE)
+summary(boosting_model)
+pred_boost <- predict(boosting_model, testData, n.trees = gbm.perf(boosting_model, method = "cv"))
+rmse_boost <- sqrt(mean((pred_boost - testData$Item_Outlet_Sales)^2))
+print(paste("RMSE for Boosting Regression: ", rmse_boost))
+head(trainData)
+```
+```{r}
+set.seed(123)
+testData$Item_Type_Aggregate <- as.factor(testData$Item_Type_Aggregate)
+testData <- testData %>% select(-Item_MRP_Outlet_Type)
+testData <- testData %>% select(-Item_Visibility_Outlet_Type)
+random_forest_model <- randomForest(Item_Outlet_Sales ~ ., data = trainData, ntree = 500, mtry = 3)
+pred_rf <- predict(random_forest_model, testData)
+rmse_rf <- sqrt(mean((pred_rf - testData$Item_Outlet_Sales)^2))
+r2_rf <- 1 - sum((pred_rf - testData$Item_Outlet_Sales)^2) / sum((testData$Item_Outlet_Sales - mean(testData$Item_Outlet_Sales))^2)
+print(paste("RMSE for Random Forest: ", rmse_rf))
+print(paste("R^2 for Random Forest: ", r2_rf))
+```
+
